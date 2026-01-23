@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 
 import numpy as np
 import torch
-from fastapi import FastAPI, File, UploadFile, HTTPException, status, Request
+from fastapi import FastAPI, File, UploadFile, HTTPException, status, Request, Form
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -333,23 +333,133 @@ async def health_check():
     }
 
 
+@app.post("/api/preprocess-person")
+@limiter.limit("20/minute")  # Higher rate limit for preprocessing
+async def preprocess_person(
+    request: Request,
+    person_image: UploadFile = File(..., description="Person image (JPEG/PNG)"),
+    cloth_type: Optional[str] = Form(None, description="Type of clothing - 'upper', 'lower', or 'overall' (default: 'upper')"),
+):
+    """
+    Preprocess person image: upload, resize, generate body segmentation mask, and cache.
+    This endpoint is called immediately after photo capture to prepare the image in parallel
+    while the user selects clothing.
+    
+    Args:
+        person_image: Person photo (JPEG/PNG, max 10MB)
+        cloth_type: Type of clothing - "upper", "lower", or "overall" (default: "upper")
+    
+    Returns:
+        JSON with cache_key that can be used in /api/try-on endpoint
+    """
+    try:
+        # Check if models are loaded
+        if not _model_loaded.is_set():
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Models are still loading. Please wait and try again."
+            )
+        
+        # Security: Validate file size (max 10MB)
+        MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+        person_image.file.seek(0, 2)  # Seek to end
+        person_size = person_image.file.tell()
+        person_image.file.seek(0)  # Reset to start
+        
+        if person_size > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"Person image too large ({person_size / 1024 / 1024:.2f}MB). Maximum size is 10MB."
+            )
+        
+        # Security: Validate file type
+        if person_image.content_type not in ["image/jpeg", "image/png", "image/jpg"]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid person image type: {person_image.content_type}. Only JPEG/PNG allowed."
+            )
+        
+        # Use defaults if not provided
+        cloth_type = cloth_type or DEFAULT_CONFIG["cloth_type"]
+        width = DEFAULT_CONFIG["width"]
+        height = DEFAULT_CONFIG["height"]
+        
+        print(f"Preprocessing person image: cloth_type={cloth_type}")
+        
+        # Read and resize person image
+        person_bytes = await person_image.read()
+        person_img = Image.open(io.BytesIO(person_bytes)).convert("RGB")
+        person_img = resize_if_needed(person_img, (width, height))
+        person_img = resize_and_crop(person_img, (width, height))
+        
+        # Check if already cached
+        cache_key = get_cache_key(person_img, cloth_type)
+        cached_data = get_cached_preprocessing(cache_key)
+        
+        if cached_data is not None:
+            # Already cached - return immediately
+            print(f"Preprocessing cache HIT: {cache_key[:16]}...")
+            return {
+                "success": True,
+                "cache_key": cache_key,
+                "message": "Preprocessing already cached",
+                "cached": True
+            }
+        
+        # Not cached - generate mask (this is the time-consuming part)
+        print("Preprocessing cache MISS: Generating mask...")
+        mask_start_time = time.time()
+        
+        # AutoMasker doesn't need GPU lock (it uses its own GPU resources)
+        mask_result = _automasker(person_img, cloth_type)
+        mask = mask_result['mask']
+        mask = _mask_processor.blur(mask, blur_factor=9)
+        
+        mask_time = time.time() - mask_start_time
+        print(f"Mask generation took {mask_time:.2f}s")
+        
+        # Cache the preprocessed image and mask
+        set_cached_preprocessing(cache_key, person_img, mask)
+        
+        return {
+            "success": True,
+            "cache_key": cache_key,
+            "message": "Preprocessing completed and cached",
+            "cached": False,
+            "processing_time_seconds": round(mask_time, 2)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error during preprocessing: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Internal server error: {str(e)}"
+        )
+
+
 @app.post("/api/try-on")
 @limiter.limit("10/minute")  # Rate limit: 10 requests per minute per IP
 async def try_on(
     request: Request,
-    person_image: UploadFile = File(..., description="Person image (JPEG/PNG)"),
     cloth_image: UploadFile = File(..., description="Cloth image (JPEG/PNG)"),
-    cloth_type: Optional[str] = None,
-    num_inference_steps: Optional[int] = None,
-    guidance_scale: Optional[float] = None,
-    seed: Optional[int] = None,
+    person_image: Optional[UploadFile] = File(None, description="Person image (JPEG/PNG) - optional if cache_key provided"),
+    cache_key: Optional[str] = Form(None, description="Cache key from /api/preprocess-person - optional if person_image provided"),
+    cloth_type: Optional[str] = Form(None, description="Type of clothing - 'upper', 'lower', or 'overall'"),
+    num_inference_steps: Optional[int] = Form(None, description="Number of diffusion steps (default: 30, max: 30)"),
+    guidance_scale: Optional[float] = Form(None, description="CFG strength (default: 2.5)"),
+    seed: Optional[int] = Form(None, description="Random seed for reproducibility (default: 42, use -1 for random)"),
 ):
     """
     Virtual try-on endpoint.
     
     Args:
-        person_image: Person photo (JPEG/PNG, max 10MB)
-        cloth_image: Clothing item image (JPEG/PNG, max 10MB)
+        cloth_image: Clothing item image (JPEG/PNG, max 10MB) - REQUIRED
+        person_image: Person photo (JPEG/PNG, max 10MB) - OPTIONAL if cache_key provided
+        cache_key: Cache key from /api/preprocess-person endpoint - OPTIONAL if person_image provided
         cloth_type: Type of clothing - "upper", "lower", or "overall" (default: "upper")
         num_inference_steps: Number of diffusion steps (default: 30, max: 30)
         guidance_scale: CFG strength (default: 2.5)
@@ -357,6 +467,11 @@ async def try_on(
     
     Returns:
         JSON with base64-encoded result image
+    
+    Note:
+        Either person_image OR cache_key must be provided. If cache_key is provided,
+        it will use cached preprocessing (faster). If person_image is provided,
+        it will process the image on-the-fly (slower but works without preprocessing).
     """
     request_start_time = time.time()
     
@@ -374,21 +489,18 @@ async def try_on(
                 detail="Models are still loading. Please wait and try again."
             )
         
-        # Security: Validate file sizes (max 10MB per file)
-        MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
-        person_image.file.seek(0, 2)  # Seek to end
-        person_size = person_image.file.tell()
-        person_image.file.seek(0)  # Reset to start
+        # Validate that either person_image or cache_key is provided
+        if not person_image and not cache_key:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Either person_image or cache_key must be provided"
+            )
         
+        # Security: Validate cloth image (always required)
+        MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
         cloth_image.file.seek(0, 2)  # Seek to end
         cloth_size = cloth_image.file.tell()
         cloth_image.file.seek(0)  # Reset to start
-        
-        if person_size > MAX_FILE_SIZE:
-            raise HTTPException(
-                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                detail=f"Person image too large ({person_size / 1024 / 1024:.2f}MB). Maximum size is 10MB."
-            )
         
         if cloth_size > MAX_FILE_SIZE:
             raise HTTPException(
@@ -396,18 +508,29 @@ async def try_on(
                 detail=f"Cloth image too large ({cloth_size / 1024 / 1024:.2f}MB). Maximum size is 10MB."
             )
         
-        # Security: Validate file types
-        if person_image.content_type not in ["image/jpeg", "image/png", "image/jpg"]:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid person image type: {person_image.content_type}. Only JPEG/PNG allowed."
-            )
-        
         if cloth_image.content_type not in ["image/jpeg", "image/png", "image/jpg"]:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Invalid cloth image type: {cloth_image.content_type}. Only JPEG/PNG allowed."
             )
+        
+        # Security: Validate person_image only if provided (not using cache_key)
+        if person_image:
+            person_image.file.seek(0, 2)  # Seek to end
+            person_size = person_image.file.tell()
+            person_image.file.seek(0)  # Reset to start
+            
+            if person_size > MAX_FILE_SIZE:
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail=f"Person image too large ({person_size / 1024 / 1024:.2f}MB). Maximum size is 10MB."
+                )
+            
+            if person_image.content_type not in ["image/jpeg", "image/png", "image/jpg"]:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid person image type: {person_image.content_type}. Only JPEG/PNG allowed."
+                )
         
         # Use defaults if not provided
         cloth_type = cloth_type or DEFAULT_CONFIG["cloth_type"]
@@ -422,46 +545,87 @@ async def try_on(
         height = DEFAULT_CONFIG["height"]
         
         # Read and validate images
-        print(f"Processing request: cloth_type={cloth_type}, steps={num_inference_steps}, guidance={guidance_scale}")
+        print(f"Processing request: cloth_type={cloth_type}, steps={num_inference_steps}, guidance={guidance_scale}, cache_key={'provided' if cache_key else 'none'}")
         
-        # Read person image
-        person_bytes = await person_image.read()
-        person_img = Image.open(io.BytesIO(person_bytes)).convert("RGB")
-        person_img = resize_if_needed(person_img, (width, height))
-        
-        # Read cloth image
+        # Read cloth image (always required)
         cloth_bytes = await cloth_image.read()
         cloth_img = Image.open(io.BytesIO(cloth_bytes)).convert("RGB")
         cloth_img = resize_if_needed(cloth_img, (width, height))
-        
-        # Resize images to model input size
-        person_img = resize_and_crop(person_img, (width, height))
         cloth_img = resize_and_padding(cloth_img, (width, height))
         
-        # Check cache for preprocessed person image and mask
-        cache_key = get_cache_key(person_img, cloth_type)
-        cached_data = get_cached_preprocessing(cache_key)
-        
-        if cached_data is not None:
-            # Cache hit - reuse preprocessed image and mask
+        # Handle person image: use cache_key if provided, otherwise process person_image
+        if cache_key:
+            # Use cached preprocessing
+            print(f"Using cache_key: {cache_key[:16]}...")
+            cached_data = get_cached_preprocessing(cache_key)
+            
+            if cached_data is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Cache key not found or expired. Please preprocess the person image again."
+                )
+            
             person_img, mask = cached_data
-            print(f"Cache HIT: Reusing preprocessed image and mask for {cache_key[:16]}...")
+            print(f"Cache HIT: Using cached preprocessing for {cache_key[:16]}...")
             with _stats_lock:
                 _request_stats["cache_hits"] += 1
         else:
-            # Cache miss - generate mask using AutoMasker
-            print("Cache MISS: Generating mask...")
-            mask_start_time = time.time()
-            mask_result = _automasker(person_img, cloth_type)
-            mask = mask_result['mask']
-            mask = _mask_processor.blur(mask, blur_factor=9)
-            mask_time = time.time() - mask_start_time
-            print(f"Mask generation took {mask_time:.2f}s")
+            # Process person_image on-the-fly (fallback mode)
+            if not person_image:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="person_image is required when cache_key is not provided"
+                )
             
-            # Cache the preprocessed image and mask
-            set_cached_preprocessing(cache_key, person_img, mask)
-            with _stats_lock:
-                _request_stats["cache_misses"] += 1
+            # Security: Validate file size (max 10MB)
+            MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+            person_image.file.seek(0, 2)  # Seek to end
+            person_size = person_image.file.tell()
+            person_image.file.seek(0)  # Reset to start
+            
+            if person_size > MAX_FILE_SIZE:
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail=f"Person image too large ({person_size / 1024 / 1024:.2f}MB). Maximum size is 10MB."
+                )
+            
+            # Security: Validate file type
+            if person_image.content_type not in ["image/jpeg", "image/png", "image/jpg"]:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid person image type: {person_image.content_type}. Only JPEG/PNG allowed."
+                )
+            
+            # Read person image
+            person_bytes = await person_image.read()
+            person_img = Image.open(io.BytesIO(person_bytes)).convert("RGB")
+            person_img = resize_if_needed(person_img, (width, height))
+            person_img = resize_and_crop(person_img, (width, height))
+            
+            # Check cache for preprocessed person image and mask
+            cache_key = get_cache_key(person_img, cloth_type)
+            cached_data = get_cached_preprocessing(cache_key)
+            
+            if cached_data is not None:
+                # Cache hit - reuse preprocessed image and mask
+                person_img, mask = cached_data
+                print(f"Cache HIT: Reusing preprocessed image and mask for {cache_key[:16]}...")
+                with _stats_lock:
+                    _request_stats["cache_hits"] += 1
+            else:
+                # Cache miss - generate mask using AutoMasker
+                print("Cache MISS: Generating mask...")
+                mask_start_time = time.time()
+                mask_result = _automasker(person_img, cloth_type)
+                mask = mask_result['mask']
+                mask = _mask_processor.blur(mask, blur_factor=9)
+                mask_time = time.time() - mask_start_time
+                print(f"Mask generation took {mask_time:.2f}s")
+                
+                # Cache the preprocessed image and mask
+                set_cached_preprocessing(cache_key, person_img, mask)
+                with _stats_lock:
+                    _request_stats["cache_misses"] += 1
         
         # Prepare generator for reproducibility
         generator = None
