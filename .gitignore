@@ -1,0 +1,88 @@
+# Learn more https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
+
+# Python (Backend - CatVTON)
+.cache/
+models/
+checkpoints/
+__pycache__/
+*.pt
+*.ckpt
+*.bin
+*.safetensors
+.env
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.log
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+venv/
+env/
+ENV/
+.venv
+
+# Node.js / Expo (Frontend - VirtualTryOn)
+node_modules/
+
+# Expo
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+
+# Native
+.kotlin/
+*.orig.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+
+# Metro
+.metro-health-check*
+
+# debug
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+
+# macOS
+.DS_Store
+*.pem
+
+# local env files
+.env*.local
+
+# typescript
+*.tsbuildinfo
+
+app-example
+
+# generated native folders
+/ios
+/android
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Root-level documentation files (do not push - only in root, not subdirectories)
+/CACHING.md
+/SECURITY_AND_RATE_LIMITING.md
+/CODE_ARCHITECTURE.md
+/TECHNICAL_DOCUMENTATION.md
+/IMPLEMENTATION_SUMMARY.md
+/INTEGRATION_GUIDE.md
+/README.md
