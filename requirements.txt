@@ -1,8 +1,4 @@
-
-torch==2.4.1+cu124
-torchvision==0.19.1+cu124
-torchaudio==2.4.1+cu124
-
+# ===== DIFFUSION STACK =====
 diffusers==0.37.0.dev0
 transformers==4.46.3
 accelerate==0.34.2
@@ -10,10 +6,13 @@ peft==0.17.0
 safetensors>=0.4.3
 huggingface_hub>=0.34.0,<2.0
 
+# ===== NUMERIC (PINNED) =====
 numpy==1.26.4
+scipy==1.13.1
+
+# ===== CV =====
 opencv-python==4.10.0.84
 scikit-image==0.24.0
-scipy==1.13.1
 pillow==10.3.0
 matplotlib==3.8.4
 fvcore==0.1.5.post20221221
@@ -24,9 +23,11 @@ omegaconf==2.3.0
 tqdm==4.66.4
 PyYAML==6.0.1
 
+# ===== API =====
 fastapi==0.128.0
 uvicorn==0.40.0
 python-multipart==0.0.21
 slowapi==0.1.9
 
+# ===== UI =====
 gradio==4.41.0
