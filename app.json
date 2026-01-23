@@ -19,7 +19,9 @@
         "monochromeImage": "./assets/images/android-icon-monochrome.png"
       },
       "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "usesCleartextTraffic": true,
+      "package": "com.yashvardhan0012.VirtualTryOn"
     },
     "web": {
       "output": "static",
@@ -43,6 +45,12 @@
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
+    },
+    "extra": {
+      "API_URL": "https://r4y6ux96gcarf6-8000.proxy.runpod.net/api/try-on",
+      "eas": {
+        "projectId": "your-project-id"
+      }
     }
   }
 }
