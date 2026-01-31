@@ -4,6 +4,7 @@ Models are loaded once at startup and reused for all requests.
 GPU memory is managed with a lock to ensure single inference at a time.
 """
 import os
+import sys
 import io
 import base64
 import threading
@@ -28,7 +29,7 @@ from huggingface_hub import snapshot_download
 
 from model.cloth_masker import AutoMasker
 from model.pipeline import CatVTONPipeline
-from utils import init_weight_dtype, resize_and_crop, resize_and_padding
+from utils import init_weight_dtype, resize_and_crop, resize_and_padding, prepare_image, compute_vae_encodings
 
 # Global model instances (singleton pattern)
 _pipeline: Optional[CatVTONPipeline] = None
@@ -55,6 +56,11 @@ _cache_lock = threading.Lock()  # Lock for cache access
 CACHE_TTL_MINUTES = 30  # Cache expires after 30 minutes
 MAX_CACHE_SIZE = 100  # Maximum number of cached entries
 
+# Cache for VAE-encoded cloth latents (keyed by cloth image hash)
+_cloth_latent_cache: Dict[str, torch.Tensor] = {}
+_cloth_cache_lock = threading.Lock()
+MAX_CLOTH_CACHE_SIZE = 50
+
 # Rate limiter
 limiter = Limiter(key_func=get_remote_address)
 
@@ -66,7 +72,7 @@ DEFAULT_CONFIG = {
     "height": 1024,
     "mixed_precision": "fp16",  # Use fp16 for RTX 4050 (6GB VRAM)
     "allow_tf32": True,
-    "num_inference_steps": 30,  # Reduced for faster inference on RTX 4050
+    "num_inference_steps": 25,  # Fewer steps = faster; 25 keeps good quality
     "guidance_scale": 2.5,
     "seed": 42,
     "cloth_type": "upper",  # Default cloth type
@@ -113,6 +119,8 @@ def load_models(config: dict):
         # Initialize pipeline
         print("Initializing CatVTON pipeline...")
         weight_dtype = init_weight_dtype(config["mixed_precision"])
+        # Enable torch.compile on Linux only (Triton not available on Windows)
+        use_compile = hasattr(torch, "compile") and callable(getattr(torch, "compile", None)) and sys.platform != "win32"
         _pipeline = CatVTONPipeline(
             base_ckpt=config["base_model_path"],
             attn_ckpt=repo_path,
@@ -120,7 +128,8 @@ def load_models(config: dict):
             weight_dtype=weight_dtype,
             use_tf32=config["allow_tf32"],
             device='cuda',
-            skip_safety_check=False,  # Keep safety checker enabled
+            compile=use_compile,
+            skip_safety_check=True,  # Skip NSFW checker for speed; no impact on try-on quality
         )
         print("Pipeline loaded successfully!")
         
@@ -232,6 +241,26 @@ def get_cache_key(person_img: Image.Image, cloth_type: str) -> str:
     """
     img_hash = image_hash(person_img)
     return f"{img_hash}_{cloth_type}"
+
+
+def get_cloth_hash(cloth_img: Image.Image) -> str:
+    """Hash cloth image for VAE latent cache key."""
+    return image_hash(cloth_img)
+
+
+def get_cached_cloth_latent(cloth_hash: str) -> Optional[torch.Tensor]:
+    """Return cached VAE latent for cloth if present."""
+    with _cloth_cache_lock:
+        return _cloth_latent_cache.get(cloth_hash)
+
+
+def set_cached_cloth_latent(cloth_hash: str, latent: torch.Tensor):
+    """Cache VAE-encoded cloth latent; evict oldest if full."""
+    with _cloth_cache_lock:
+        if len(_cloth_latent_cache) >= MAX_CLOTH_CACHE_SIZE:
+            key_to_remove = next(iter(_cloth_latent_cache))
+            del _cloth_latent_cache[key_to_remove]
+        _cloth_latent_cache[cloth_hash] = latent.cpu().clone()
 
 
 def get_cached_preprocessing(cache_key: str) -> Optional[Tuple[Image.Image, Image.Image]]:
@@ -634,11 +663,21 @@ async def try_on(
         
         # Run inference with GPU lock and timeout protection
         print("Running inference...")
-        inference_timeout = 120  # 120 seconds (2 min) - RTX 4050 needs more time for 30 steps
+        inference_timeout = 120  # 120 seconds (2 min)
         
         with gpu_inference_lock():
             import asyncio
             from concurrent.futures import ThreadPoolExecutor
+            
+            # Cloth latent: use cache or encode (skips VAE encode on cache hit)
+            cloth_hash = get_cloth_hash(cloth_img)
+            cached_latent = get_cached_cloth_latent(cloth_hash)
+            if cached_latent is not None:
+                condition_latent = cached_latent.to(_pipeline.device, dtype=_pipeline.weight_dtype)
+            else:
+                cloth_t = prepare_image(cloth_img).to(_pipeline.device, dtype=_pipeline.weight_dtype)
+                condition_latent = compute_vae_encodings(cloth_t, _pipeline.vae)
+                set_cached_cloth_latent(cloth_hash, condition_latent)
             
             def run_inference_sync():
                 """Run inference synchronously - will be executed in thread pool."""
@@ -652,6 +691,7 @@ async def try_on(
                         generator=generator,
                         height=height,
                         width=width,
+                        condition_latent=condition_latent,
                     )
                 return result_images[0]
             

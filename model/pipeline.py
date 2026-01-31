@@ -120,19 +120,24 @@ class CatVTONPipeline:
         width: int = 768,
         generator=None,
         eta=1.0,
+        condition_latent=None,
         **kwargs
     ):
         concat_dim = -2  # FIXME: y axis concat
         # Prepare inputs to Tensor
         image, condition_image, mask = self.check_inputs(image, condition_image, mask, width, height)
         image = prepare_image(image).to(self.device, dtype=self.weight_dtype)
-        condition_image = prepare_image(condition_image).to(self.device, dtype=self.weight_dtype)
         mask = prepare_mask_image(mask).to(self.device, dtype=self.weight_dtype)
         # Mask image
         masked_image = image * (mask < 0.5)
         # VAE encoding
         masked_latent = compute_vae_encodings(masked_image, self.vae)
-        condition_latent = compute_vae_encodings(condition_image, self.vae)
+        if condition_latent is None:
+            condition_image_t = prepare_image(condition_image).to(self.device, dtype=self.weight_dtype)
+            condition_latent = compute_vae_encodings(condition_image_t, self.vae)
+            del condition_image_t
+        else:
+            condition_latent = condition_latent.to(self.device, dtype=self.weight_dtype)
         mask_latent = torch.nn.functional.interpolate(mask, size=masked_latent.shape[-2:], mode="nearest")
         del image, mask, condition_image
         # Concatenate latents
