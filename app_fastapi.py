@@ -3,6 +3,7 @@ FastAPI backend for CatVTON virtual try-on service.
 Models are loaded once at startup and reused for all requests.
 GPU memory is managed with a lock to ensure single inference at a time.
 """
+import asyncio
 import os
 import sys
 import io
@@ -60,6 +61,9 @@ MAX_CACHE_SIZE = 100  # Maximum number of cached entries
 _cloth_latent_cache: Dict[str, torch.Tensor] = {}
 _cloth_cache_lock = threading.Lock()
 MAX_CLOTH_CACHE_SIZE = 50
+
+# GPU keep-warm: ping GPU every N seconds so it doesn't go cold (e.g. on cloud instances)
+GPU_KEEP_WARM_INTERVAL_SEC = 5 * 60  # 5 minutes
 
 # Rate limiter
 limiter = Limiter(key_func=get_remote_address)
@@ -319,10 +323,38 @@ def set_cached_preprocessing(cache_key: str, person_img: Image.Image, mask: Imag
         print(f"Cache stored entry: {cache_key[:16]}... (cache size: {len(_preprocessing_cache)})")
 
 
+def _gpu_keep_warm_ping():
+    """Run a minimal GPU op to prevent GPU from going cold (e.g. on cloud instances)."""
+    if not torch.cuda.is_available() or not _model_loaded.is_set():
+        return
+    try:
+        with torch.no_grad():
+            x = torch.zeros(1, device="cuda", dtype=torch.float32)
+            _ = x + 1
+        torch.cuda.synchronize()
+        print(f"[keep-warm] GPU ping at {datetime.now().isoformat()}")
+    except Exception as e:
+        print(f"[keep-warm] GPU ping failed: {e}")
+
+
+async def _gpu_keep_warm_loop():
+    """Background loop: ping GPU every GPU_KEEP_WARM_INTERVAL_SEC so it doesn't go cold."""
+    if GPU_KEEP_WARM_INTERVAL_SEC <= 0:
+        return
+    await asyncio.sleep(60)  # Wait 1 min after startup before first ping
+    while True:
+        try:
+            await asyncio.to_thread(_gpu_keep_warm_ping)
+        except Exception as e:
+            print(f"[keep-warm] Error: {e}")
+        await asyncio.sleep(GPU_KEEP_WARM_INTERVAL_SEC)
+
+
 @app.on_event("startup")
 async def startup_event():
     """Load models when FastAPI starts."""
     load_models(DEFAULT_CONFIG)
+    asyncio.create_task(_gpu_keep_warm_loop())
 
 
 @app.get("/health")
@@ -841,6 +873,7 @@ if __name__ == "__main__":
     parser.add_argument("--width", type=int, default=DEFAULT_CONFIG["width"])
     parser.add_argument("--height", type=int, default=DEFAULT_CONFIG["height"])
     parser.add_argument("--mixed-precision", type=str, default=DEFAULT_CONFIG["mixed_precision"], choices=["no", "fp16", "bf16"])
+    parser.add_argument("--gpu-keep-warm-minutes", type=int, default=5, help="Ping GPU every N minutes so it doesn't go cold (0 = disable)")
     
     args = parser.parse_args()
     
@@ -852,6 +885,10 @@ if __name__ == "__main__":
         "height": args.height,
         "mixed_precision": args.mixed_precision,
     })
+    if args.gpu_keep_warm_minutes > 0:
+        globals()["GPU_KEEP_WARM_INTERVAL_SEC"] = args.gpu_keep_warm_minutes * 60
+    else:
+        globals()["GPU_KEEP_WARM_INTERVAL_SEC"] = 0
     
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port)
