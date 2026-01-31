@@ -108,7 +108,7 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     """Return JSON for 422 so client gets a clear error (e.g. multipart parse failure)."""
-    print("TRY-ON PARSE/VALIDATION FAILED:", exc.errors(), flush=True)
+    print("[TRY-ON] PARSE/VALIDATION FAILED (422):", exc.errors(), flush=True)
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={"detail": exc.errors(), "message": "Invalid request body. Ensure Content-Type is multipart/form-data with boundary, and fields: cloth_image, cache_key or person_image, cloth_type."},
@@ -122,6 +122,20 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# Logging middleware: log when POST /api/try-on arrives (before body is parsed)
+@app.middleware("http")
+async def log_tryon_requests(request: Request, call_next):
+    if request.method == "POST" and request.url.path == "/api/try-on":
+        client = request.client.host if request.client else "unknown"
+        forwarded = request.headers.get("X-Forwarded-For", "")
+        content_type = request.headers.get("Content-Type", "none")
+        print(f"[TRY-ON] POST /api/try-on arrived | client={client} forwarded={forwarded!r} Content-Type={content_type!r}", flush=True)
+    response = await call_next(request)
+    if request.method == "POST" and request.url.path == "/api/try-on":
+        print(f"[TRY-ON] POST /api/try-on response status={response.status_code}", flush=True)
+    return response
 
 
 def load_models(config: dict):
@@ -526,7 +540,7 @@ async def try_on(
         it will use cached preprocessing (faster). If person_image is provided,
         it will process the image on-the-fly (slower but works without preprocessing).
     """
-    print("TRY-ON REQUEST RECEIVED", flush=True)
+    print("[TRY-ON] Step 1: Body parsed, handler entered", flush=True)
     request_start_time = time.time()
     
     # Update request stats
@@ -537,6 +551,7 @@ async def try_on(
     
     try:
         # Check if models are loaded
+        print("[TRY-ON] Step 2: Checking models loaded...", flush=True)
         if not _model_loaded.is_set():
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -544,6 +559,7 @@ async def try_on(
             )
         
         # Validate that either person_image or cache_key is provided
+        print("[TRY-ON] Step 3: Validating person_image or cache_key...", flush=True)
         if not person_image and not cache_key:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -551,10 +567,12 @@ async def try_on(
             )
         
         # Security: Validate cloth image (always required)
+        print("[TRY-ON] Step 4: Validating cloth image...", flush=True)
         MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
         cloth_image.file.seek(0, 2)  # Seek to end
         cloth_size = cloth_image.file.tell()
         cloth_image.file.seek(0)  # Reset to start
+        print(f"[TRY-ON] Step 4: cloth_size={cloth_size} bytes, content_type={cloth_image.content_type!r}", flush=True)
         
         if cloth_size > MAX_FILE_SIZE:
             raise HTTPException(
@@ -600,15 +618,19 @@ async def try_on(
         height = DEFAULT_CONFIG["height"]
         
         # Read and validate images
-        print(f"Processing request: cloth_type={cloth_type}, steps={num_inference_steps}, guidance={guidance_scale}, cache_key={'provided' if cache_key else 'none'}")
+        print(f"[TRY-ON] Step 5: cloth_type={cloth_type}, steps={num_inference_steps}, cache_key={'yes' if cache_key else 'no'}", flush=True)
         
         # Read cloth image (always required)
+        print("[TRY-ON] Step 6: Reading cloth image bytes...", flush=True)
         cloth_bytes = await cloth_image.read()
+        print(f"[TRY-ON] Step 6: Read {len(cloth_bytes)} cloth bytes", flush=True)
         cloth_img = Image.open(io.BytesIO(cloth_bytes)).convert("RGB")
         cloth_img = resize_if_needed(cloth_img, (width, height))
         cloth_img = resize_and_padding(cloth_img, (width, height))
+        print("[TRY-ON] Step 6: Cloth image loaded and resized", flush=True)
         
         # Handle person image: use cache_key if provided, otherwise process person_image
+        print("[TRY-ON] Step 7: Resolving person image (cache or upload)...", flush=True)
         if cache_key:
             # Use cached preprocessing
             print(f"Using cache_key: {cache_key[:16]}...")
@@ -621,7 +643,7 @@ async def try_on(
                 )
             
             person_img, mask = cached_data
-            print(f"Cache HIT: Using cached preprocessing for {cache_key[:16]}...")
+            print(f"[TRY-ON] Step 7: Cache HIT for {cache_key[:16]}...", flush=True)
             with _stats_lock:
                 _request_stats["cache_hits"] += 1
         else:
@@ -683,12 +705,13 @@ async def try_on(
                     _request_stats["cache_misses"] += 1
         
         # Prepare generator for reproducibility
+        print("[TRY-ON] Step 8: Preparing generator, acquiring GPU lock...", flush=True)
         generator = None
         if seed != -1:
             generator = torch.Generator(device='cuda').manual_seed(seed)
         
         # Run inference with GPU lock and timeout protection
-        print("Running inference...")
+        print("[TRY-ON] Step 9: Running inference...", flush=True)
         inference_timeout = 120  # 120 seconds (2 min)
         
         with gpu_inference_lock():
@@ -749,10 +772,11 @@ async def try_on(
             torch.cuda.empty_cache()
         
         # Convert to base64
+        print("[TRY-ON] Step 10: Encoding result to base64...", flush=True)
         result_base64 = image_to_base64(result_image)
         
         total_time = time.time() - request_start_time
-        print(f"Inference completed successfully! Total time: {total_time:.2f}s")
+        print(f"[TRY-ON] Step 11: Done. Total time: {total_time:.2f}s", flush=True)
         
         return {
             "success": True,
@@ -761,17 +785,18 @@ async def try_on(
             "processing_time_seconds": round(total_time, 2)
         }
         
-    except HTTPException:
-        # Re-raise HTTP exceptions
+    except HTTPException as he:
+        print(f"[TRY-ON] ERROR: HTTPException status={he.status_code} detail={he.detail}", flush=True)
         raise
     except torch.cuda.OutOfMemoryError as e:
+        print(f"[TRY-ON] ERROR: GPU OOM: {e}", flush=True)
         torch.cuda.empty_cache()
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"GPU out of memory: {str(e)}"
         )
     except Exception as e:
-        print(f"Error during inference: {e}")
+        print(f"[TRY-ON] ERROR: Exception: {e}", flush=True)
         import traceback
         traceback.print_exc()
         raise HTTPException(
@@ -782,6 +807,7 @@ async def try_on(
         # Update stats (always decrement active requests)
         with _stats_lock:
             _request_stats["active_requests"] = max(0, _request_stats["active_requests"] - 1)
+        print("[TRY-ON] Handler finished (finally)", flush=True)
 
 
 @app.get("/")
