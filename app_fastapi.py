@@ -21,8 +21,19 @@ import torch
 from fastapi import FastAPI, File, UploadFile, HTTPException, status, Request, Form
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
+
+
+def get_client_ip(request: Request) -> str:
+    """Use X-Forwarded-For when behind proxy (e.g. RunPod) so rate limit is per client."""
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    if request.client:
+        return request.client.host
+    return get_remote_address(request)
 from slowapi.errors import RateLimitExceeded
 from PIL import Image
 from diffusers.image_processor import VaeImageProcessor
@@ -62,8 +73,8 @@ _cloth_latent_cache: Dict[str, torch.Tensor] = {}
 _cloth_cache_lock = threading.Lock()
 MAX_CLOTH_CACHE_SIZE = 50
 
-# Rate limiter
-limiter = Limiter(key_func=get_remote_address)
+# Rate limiter (use client IP from X-Forwarded-For when behind proxy)
+limiter = Limiter(key_func=get_client_ip)
 
 # Default configuration
 DEFAULT_CONFIG = {
@@ -73,7 +84,7 @@ DEFAULT_CONFIG = {
     "height": 1024,
     "mixed_precision": "fp16",  # Use fp16 for RTX 4050 (6GB VRAM)
     "allow_tf32": True,
-    "num_inference_steps": 25,  # Fewer steps = faster; 25 keeps good quality
+    "num_inference_steps": 20,  # Fewer steps = faster; finish before common proxy timeout (60s)
     "guidance_scale": 2.5,
     "seed": 42,
     "cloth_type": "upper",  # Default cloth type
@@ -92,6 +103,16 @@ app = FastAPI(title="CatVTON API", version="1.0.0", lifespan=lifespan)
 # Initialize rate limiter
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Return JSON for 422 so client gets a clear error (e.g. multipart parse failure)."""
+    print("TRY-ON PARSE/VALIDATION FAILED:", exc.errors(), flush=True)
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": exc.errors(), "message": "Invalid request body. Ensure Content-Type is multipart/form-data with boundary, and fields: cloth_image, cache_key or person_image, cloth_type."},
+    )
 
 # CORS middleware for Expo app
 app.add_middleware(
@@ -474,7 +495,7 @@ async def preprocess_person(
 
 
 @app.post("/api/try-on")
-@limiter.limit("10/minute")  # Rate limit: 10 requests per minute per IP
+@limiter.limit("30/minute")  # Rate limit per client (X-Forwarded-For when behind proxy)
 async def try_on(
     request: Request,
     cloth_image: UploadFile = File(..., description="Cloth image (JPEG/PNG)"),
@@ -505,6 +526,7 @@ async def try_on(
         it will use cached preprocessing (faster). If person_image is provided,
         it will process the image on-the-fly (slower but works without preprocessing).
     """
+    print("TRY-ON REQUEST RECEIVED", flush=True)
     request_start_time = time.time()
     
     # Update request stats
@@ -540,7 +562,8 @@ async def try_on(
                 detail=f"Cloth image too large ({cloth_size / 1024 / 1024:.2f}MB). Maximum size is 10MB."
             )
         
-        if cloth_image.content_type not in ["image/jpeg", "image/png", "image/jpg"]:
+        allowed_types = ["image/jpeg", "image/png", "image/jpg"]
+        if cloth_image.content_type is not None and cloth_image.content_type not in allowed_types:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Invalid cloth image type: {cloth_image.content_type}. Only JPEG/PNG allowed."
@@ -558,7 +581,7 @@ async def try_on(
                     detail=f"Person image too large ({person_size / 1024 / 1024:.2f}MB). Maximum size is 10MB."
                 )
             
-            if person_image.content_type not in ["image/jpeg", "image/png", "image/jpg"]:
+            if person_image.content_type is not None and person_image.content_type not in ["image/jpeg", "image/png", "image/jpg"]:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Invalid person image type: {person_image.content_type}. Only JPEG/PNG allowed."
@@ -621,8 +644,8 @@ async def try_on(
                     detail=f"Person image too large ({person_size / 1024 / 1024:.2f}MB). Maximum size is 10MB."
                 )
             
-            # Security: Validate file type
-            if person_image.content_type not in ["image/jpeg", "image/png", "image/jpg"]:
+            # Security: Validate file type (allow None for clients that don't set Content-Type on parts)
+            if person_image.content_type is not None and person_image.content_type not in ["image/jpeg", "image/png", "image/jpg"]:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Invalid person image type: {person_image.content_type}. Only JPEG/PNG allowed."
