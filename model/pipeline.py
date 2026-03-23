@@ -62,7 +62,11 @@ class CatVTONPipeline:
             "dresscode": "dresscode-16k-512",
         }[version]
         if os.path.exists(attn_ckpt):
-            load_checkpoint_in_model(self.attn_modules, os.path.join(attn_ckpt, sub_folder, 'attention'))
+            load_checkpoint_in_model(
+                self.attn_modules,
+                os.path.join(attn_ckpt, sub_folder, 'attention'),
+                device_map={"": "cuda"}
+            )
         else:
             repo_path = snapshot_download(repo_id=attn_ckpt)
             print(f"Downloaded {attn_ckpt} to {repo_path}")
