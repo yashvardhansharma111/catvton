@@ -89,6 +89,7 @@ DEFAULT_CONFIG = {
     "guidance_scale": 2.5,
     "seed": 42,
     "cloth_type": "upper",  # Default cloth type
+    "enable_torch_compile": False,  # Disable by default to avoid 60-120s first-request compile latency
 }
 
 
@@ -164,8 +165,14 @@ def load_models(config: dict):
         # Initialize pipeline
         print("Initializing CatVTON pipeline...")
         weight_dtype = init_weight_dtype(config["mixed_precision"])
-        # Enable torch.compile on Linux only (Triton not available on Windows)
-        use_compile = hasattr(torch, "compile") and callable(getattr(torch, "compile", None)) and sys.platform != "win32"
+        # torch.compile can add large warmup/recompile overhead in production with dynamic shapes.
+        # Keep it opt-in via config/CLI for users who explicitly want throughput over first-token latency.
+        use_compile = (
+            bool(config.get("enable_torch_compile", False))
+            and hasattr(torch, "compile")
+            and callable(getattr(torch, "compile", None))
+            and sys.platform != "win32"
+        )
         _pipeline = CatVTONPipeline(
             base_ckpt=config["base_model_path"],
             attn_ckpt=repo_path,
@@ -498,8 +505,10 @@ async def preprocess_person(
         print("Preprocessing cache MISS: Generating mask...")
         mask_start_time = time.time()
         
-        # AutoMasker doesn't need GPU lock (it uses its own GPU resources)
-        mask_result = _automasker(person_img, cloth_type)
+        # AutoMasker runs on the same GPU and can slow active try-on inference.
+        # Serialize with inference lock to avoid contention spikes.
+        with gpu_inference_lock():
+            mask_result = _automasker(person_img, cloth_type)
         person_img = remove_background_from_person(person_img, mask_result)
         mask = mask_result['mask']
         mask = _mask_processor.blur(mask, blur_factor=9)
@@ -715,7 +724,8 @@ async def try_on(
                 # Cache miss - generate mask using AutoMasker
                 print("Cache MISS: Generating mask...")
                 mask_start_time = time.time()
-                mask_result = _automasker(person_img, cloth_type)
+                with gpu_inference_lock():
+                    mask_result = _automasker(person_img, cloth_type)
                 person_img = remove_background_from_person(person_img, mask_result)
                 mask = mask_result['mask']
                 mask = _mask_processor.blur(mask, blur_factor=9)
@@ -916,6 +926,7 @@ if __name__ == "__main__":
     parser.add_argument("--width", type=int, default=DEFAULT_CONFIG["width"])
     parser.add_argument("--height", type=int, default=DEFAULT_CONFIG["height"])
     parser.add_argument("--mixed-precision", type=str, default=DEFAULT_CONFIG["mixed_precision"], choices=["no", "fp16", "bf16"])
+    parser.add_argument("--enable-compile", action="store_true", help="Enable torch.compile (can increase warmup latency)")
     
     args = parser.parse_args()
     
@@ -926,6 +937,7 @@ if __name__ == "__main__":
         "width": args.width,
         "height": args.height,
         "mixed_precision": args.mixed_precision,
+        "enable_torch_compile": args.enable_compile,
     })
     
     import uvicorn
