@@ -18,6 +18,7 @@ from datetime import datetime, timedelta
 
 import numpy as np
 import torch
+import cv2
 from fastapi import FastAPI, File, UploadFile, HTTPException, status, Request, Form
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -278,6 +279,26 @@ def image_hash(image: Image.Image) -> str:
     return hashlib.md5(img_bytes.getvalue()).hexdigest()
 
 
+def remove_background_from_person(person_img: Image.Image, automask_result: Dict) -> Image.Image:
+    """
+    Remove scene background using SCHP parsing maps from AutoMasker.
+    Keeps foreground body pixels and replaces background with a neutral backdrop.
+    """
+    rgb = np.array(person_img.convert("RGB"))
+    schp_atr = np.array(automask_result["schp_atr"])
+    schp_lip = np.array(automask_result["schp_lip"])
+
+    # Label 0 is background in both parsers; keep pixel if either parser marks foreground.
+    fg = ((schp_atr != 0) | (schp_lip != 0)).astype(np.uint8) * 255
+    fg = cv2.dilate(fg, np.ones((5, 5), np.uint8), iterations=1)
+    fg = cv2.GaussianBlur(fg, (7, 7), 0)
+    alpha = np.clip(fg.astype(np.float32) / 255.0, 0.0, 1.0)[..., None]
+
+    bg = np.full_like(rgb, 245, dtype=np.uint8)
+    composited = (rgb.astype(np.float32) * alpha + bg.astype(np.float32) * (1.0 - alpha)).astype(np.uint8)
+    return Image.fromarray(composited)
+
+
 def get_cache_key(person_img: Image.Image, cloth_type: str) -> str:
     """
     Generate cache key from person image hash and cloth type.
@@ -479,6 +500,7 @@ async def preprocess_person(
         
         # AutoMasker doesn't need GPU lock (it uses its own GPU resources)
         mask_result = _automasker(person_img, cloth_type)
+        person_img = remove_background_from_person(person_img, mask_result)
         mask = mask_result['mask']
         mask = _mask_processor.blur(mask, blur_factor=9)
         
@@ -694,6 +716,7 @@ async def try_on(
                 print("Cache MISS: Generating mask...")
                 mask_start_time = time.time()
                 mask_result = _automasker(person_img, cloth_type)
+                person_img = remove_background_from_person(person_img, mask_result)
                 mask = mask_result['mask']
                 mask = _mask_processor.blur(mask, blur_factor=9)
                 mask_time = time.time() - mask_start_time
