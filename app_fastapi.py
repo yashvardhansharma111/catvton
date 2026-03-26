@@ -215,21 +215,21 @@ def load_models(config: dict):
 
 
 @contextmanager
-def gpu_inference_lock():
+def gpu_inference_lock(timeout_seconds: int = 180, busy_detail: Optional[str] = None):
     """
     Context manager to ensure only one inference runs at a time.
     This prevents GPU OOM errors.
     Tracks lock wait times for performance monitoring.
     """
     lock_wait_start = time.time()
-    acquired = _model_lock.acquire(timeout=180)  # 3 minute timeout (reduced from 5 min)
+    acquired = _model_lock.acquire(timeout=timeout_seconds)
     
     if not acquired:
         wait_time = time.time() - lock_wait_start
         print(f"WARNING: GPU lock timeout after {wait_time:.2f}s - request rejected")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="GPU is busy processing another request. Please try again in a few moments."
+            detail=busy_detail or "GPU is busy processing another request. Please try again in a few moments."
         )
     
     wait_time = time.time() - lock_wait_start
@@ -507,7 +507,10 @@ async def preprocess_person(
         
         # AutoMasker runs on the same GPU and can slow active try-on inference.
         # Serialize with inference lock to avoid contention spikes.
-        with gpu_inference_lock():
+        with gpu_inference_lock(
+            timeout_seconds=8,
+            busy_detail="GPU busy; preprocess skipped. Try-on can still proceed and will preprocess on demand.",
+        ):
             mask_result = _automasker(person_img, cloth_type)
         person_img = remove_background_from_person(person_img, mask_result)
         mask = mask_result['mask']
@@ -724,7 +727,10 @@ async def try_on(
                 # Cache miss - generate mask using AutoMasker
                 print("Cache MISS: Generating mask...")
                 mask_start_time = time.time()
-                with gpu_inference_lock():
+                with gpu_inference_lock(
+                    timeout_seconds=8,
+                    busy_detail="GPU busy; preprocess skipped. Try-on can still proceed and will preprocess on demand.",
+                ):
                     mask_result = _automasker(person_img, cloth_type)
                 person_img = remove_background_from_person(person_img, mask_result)
                 mask = mask_result['mask']
