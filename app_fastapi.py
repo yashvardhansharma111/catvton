@@ -85,12 +85,23 @@ DEFAULT_CONFIG = {
     "height": 1024,
     "mixed_precision": "fp16",  # Use fp16 for RTX 4050 (6GB VRAM)
     "allow_tf32": True,
-    "num_inference_steps": 20,  # Fewer steps = faster; finish before common proxy timeout (60s)
+    "num_inference_steps": 30,  # Balanced quality/speed; CatVTON paper uses 50
     "guidance_scale": 2.5,
     "seed": 42,
     "cloth_type": "upper",  # Default cloth type
     "enable_torch_compile": False,  # Disable by default to avoid 60-120s first-request compile latency
+    "mask_blur_factor": 5,  # Lower = sharper try-on edges (was 9, which over-softened boundaries)
+    "output_format": "jpeg",  # 'jpeg' (faster, smaller) or 'png' (lossless, larger)
+    "output_jpeg_quality": 98,  # 95→98 for less compression artifacting
 }
+
+# Step counts per quality mode. Clients can pick fast/balanced/high without knowing the exact step number.
+QUALITY_MODE_STEPS = {
+    "fast": 20,
+    "balanced": 30,
+    "high": 50,
+}
+MAX_INFERENCE_STEPS = 50  # Hard ceiling; CatVTON paper goes up to 50
 
 
 @asynccontextmanager
@@ -247,12 +258,22 @@ def gpu_inference_lock(timeout_seconds: int = 180, busy_detail: Optional[str] = 
         _model_lock.release()
 
 
-def image_to_base64(image: Image.Image) -> str:
-    """Convert PIL Image to base64 string."""
+def image_to_base64(image: Image.Image, fmt: str = "jpeg", jpeg_quality: int = 98) -> Tuple[str, str]:
+    """
+    Convert PIL Image to base64. Returns (base64_str, mime_type).
+    JPEG uses subsampling=0 + optimize=True for minimal chroma loss at high quality.
+    PNG is lossless but ~3x larger.
+    """
     buffer = io.BytesIO()
-    image.save(buffer, format="JPEG", quality=95)
-    img_bytes = buffer.getvalue()
-    return base64.b64encode(img_bytes).decode("utf-8")
+    fmt_lower = (fmt or "jpeg").lower()
+    if fmt_lower == "png":
+        image.save(buffer, format="PNG", optimize=True)
+        mime = "image/png"
+    else:
+        # subsampling=0 (4:4:4) preserves color detail; optimize=True trims metadata.
+        image.save(buffer, format="JPEG", quality=jpeg_quality, subsampling=0, optimize=True)
+        mime = "image/jpeg"
+    return base64.b64encode(buffer.getvalue()).decode("utf-8"), mime
 
 
 def resize_if_needed(image: Image.Image, max_size: tuple = (768, 1024)) -> Image.Image:
@@ -290,15 +311,28 @@ def remove_background_from_person(person_img: Image.Image, automask_result: Dict
     """
     Remove scene background using SCHP parsing maps from AutoMasker.
     Keeps foreground body pixels and replaces background with a neutral backdrop.
+
+    Uses generous dilation (11x11 ×2 iters) so SCHP gaps around hands/hair don't clip
+    the body — clipped body parts were a major source of "output not close to expected".
+    A wider Gaussian blur creates a soft alpha falloff so the bg edge looks natural.
+    Falls back to the original image if SCHP coverage is suspiciously low (<5% of pixels).
     """
     rgb = np.array(person_img.convert("RGB"))
     schp_atr = np.array(automask_result["schp_atr"])
     schp_lip = np.array(automask_result["schp_lip"])
 
     # Label 0 is background in both parsers; keep pixel if either parser marks foreground.
-    fg = ((schp_atr != 0) | (schp_lip != 0)).astype(np.uint8) * 255
-    fg = cv2.dilate(fg, np.ones((5, 5), np.uint8), iterations=1)
-    fg = cv2.GaussianBlur(fg, (7, 7), 0)
+    fg_raw = ((schp_atr != 0) | (schp_lip != 0)).astype(np.uint8)
+
+    # Safety check: if SCHP returned almost nothing, segmentation failed — keep original
+    # image rather than wiping out the person entirely.
+    if fg_raw.mean() < 0.05:
+        print("WARNING: SCHP foreground coverage <5%; skipping background removal", flush=True)
+        return person_img
+
+    fg = fg_raw * 255
+    fg = cv2.dilate(fg, np.ones((11, 11), np.uint8), iterations=2)
+    fg = cv2.GaussianBlur(fg, (15, 15), 0)
     alpha = np.clip(fg.astype(np.float32) / 255.0, 0.0, 1.0)[..., None]
 
     bg = np.full_like(rgb, 245, dtype=np.uint8)
@@ -514,11 +548,11 @@ async def preprocess_person(
             mask_result = _automasker(person_img, cloth_type)
         person_img = remove_background_from_person(person_img, mask_result)
         mask = mask_result['mask']
-        mask = _mask_processor.blur(mask, blur_factor=9)
-        
+        mask = _mask_processor.blur(mask, blur_factor=DEFAULT_CONFIG["mask_blur_factor"])
+
         mask_time = time.time() - mask_start_time
         print(f"Mask generation took {mask_time:.2f}s")
-        
+
         # Cache the preprocessed image and mask
         set_cached_preprocessing(cache_key, person_img, mask)
         
@@ -550,9 +584,11 @@ async def try_on(
     person_image: Optional[UploadFile] = File(None, description="Person image (JPEG/PNG) - optional if cache_key provided"),
     cache_key: Optional[str] = Form(None, description="Cache key from /api/preprocess-person - optional if person_image provided"),
     cloth_type: Optional[str] = Form(None, description="Type of clothing - 'upper', 'lower', or 'overall'"),
-    num_inference_steps: Optional[int] = Form(None, description="Number of diffusion steps (default: 30, max: 30)"),
+    num_inference_steps: Optional[int] = Form(None, description=f"Number of diffusion steps (default: 30, max: {MAX_INFERENCE_STEPS})"),
     guidance_scale: Optional[float] = Form(None, description="CFG strength (default: 2.5)"),
     seed: Optional[int] = Form(None, description="Random seed for reproducibility (default: 42, use -1 for random)"),
+    quality_mode: Optional[str] = Form(None, description="'fast' (20 steps) | 'balanced' (30 steps) | 'high' (50 steps). Overridden by num_inference_steps if both supplied."),
+    output_format: Optional[str] = Form(None, description="'jpeg' (default) or 'png' (lossless, larger payload)"),
 ):
     """
     Virtual try-on endpoint.
@@ -641,15 +677,24 @@ async def try_on(
         
         # Use defaults if not provided
         cloth_type = cloth_type or DEFAULT_CONFIG["cloth_type"]
-        # Clamp num_inference_steps to prevent OOM (max 30 for production safety)
-        requested_steps = num_inference_steps or DEFAULT_CONFIG["num_inference_steps"]
-        num_inference_steps = min(requested_steps, 30)  # Hard limit for production
-        if requested_steps > 30:
-            print(f"WARNING: num_inference_steps clamped from {requested_steps} to 30 for safety")
+        # Resolve step count: explicit num_inference_steps wins; otherwise use quality_mode preset; otherwise default.
+        if num_inference_steps is None:
+            if quality_mode and quality_mode.lower() in QUALITY_MODE_STEPS:
+                requested_steps = QUALITY_MODE_STEPS[quality_mode.lower()]
+            else:
+                requested_steps = DEFAULT_CONFIG["num_inference_steps"]
+        else:
+            requested_steps = num_inference_steps
+        num_inference_steps = min(requested_steps, MAX_INFERENCE_STEPS)
+        if requested_steps > MAX_INFERENCE_STEPS:
+            print(f"WARNING: num_inference_steps clamped from {requested_steps} to {MAX_INFERENCE_STEPS} for safety")
         guidance_scale = guidance_scale or DEFAULT_CONFIG["guidance_scale"]
         seed = seed if seed is not None else DEFAULT_CONFIG["seed"]
         width = DEFAULT_CONFIG["width"]
         height = DEFAULT_CONFIG["height"]
+        out_fmt = (output_format or DEFAULT_CONFIG["output_format"]).lower()
+        if out_fmt not in ("jpeg", "png"):
+            out_fmt = "jpeg"
         
         # Read and validate images
         print(f"[TRY-ON] Step 5: cloth_type={cloth_type}, steps={num_inference_steps}, cache_key={'yes' if cache_key else 'no'}", flush=True)
@@ -734,7 +779,7 @@ async def try_on(
                     mask_result = _automasker(person_img, cloth_type)
                 person_img = remove_background_from_person(person_img, mask_result)
                 mask = mask_result['mask']
-                mask = _mask_processor.blur(mask, blur_factor=9)
+                mask = _mask_processor.blur(mask, blur_factor=DEFAULT_CONFIG["mask_blur_factor"])
                 mask_time = time.time() - mask_start_time
                 print(f"Mask generation took {mask_time:.2f}s")
                 
@@ -812,16 +857,20 @@ async def try_on(
         
         # Convert to base64
         print("[TRY-ON] Step 10: Encoding result to base64...", flush=True)
-        result_base64 = image_to_base64(result_image)
-        
+        result_base64, result_mime = image_to_base64(
+            result_image, fmt=out_fmt, jpeg_quality=DEFAULT_CONFIG["output_jpeg_quality"]
+        )
+
         total_time = time.time() - request_start_time
-        print(f"[TRY-ON] Step 11: Done. Total time: {total_time:.2f}s", flush=True)
-        
+        print(f"[TRY-ON] Step 11: Done. Total time: {total_time:.2f}s | steps={num_inference_steps} fmt={out_fmt}", flush=True)
+
         return {
             "success": True,
             "imageBase64": result_base64,
+            "imageMimeType": result_mime,
             "message": "Try-on completed successfully",
-            "processing_time_seconds": round(total_time, 2)
+            "processing_time_seconds": round(total_time, 2),
+            "inference_steps": num_inference_steps,
         }
         
     except HTTPException as he:
