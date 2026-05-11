@@ -10,6 +10,11 @@ huggingface_hub>=0.34.0,<2.0
 numpy==1.26.4
 scipy==1.13.1
 
+# ===== BiRefNet (background removal) =====
+einops
+timm
+kornia
+
 # ===== CV =====
 opencv-python==4.10.0.84
 scikit-image==0.24.0

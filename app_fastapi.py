@@ -18,6 +18,7 @@ from datetime import datetime, timedelta
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import cv2
 from fastapi import FastAPI, File, UploadFile, HTTPException, status, Request, Form
 from fastapi.responses import JSONResponse
@@ -48,6 +49,7 @@ from utils import init_weight_dtype, resize_and_crop, resize_and_padding, prepar
 _pipeline: Optional[CatVTONPipeline] = None
 _automasker: Optional[AutoMasker] = None
 _mask_processor: Optional[VaeImageProcessor] = None
+_birefnet = None  # BiRefNet matting model (replaces SCHP+OpenCV bg removal)
 _model_lock = threading.Lock()  # Lock for GPU inference (single inference at a time)
 _model_loaded = threading.Event()  # Event to signal when models are loaded
 
@@ -90,7 +92,7 @@ DEFAULT_CONFIG = {
     "seed": 42,
     "cloth_type": "upper",  # Default cloth type
     "enable_torch_compile": False,  # Disable by default to avoid 60-120s first-request compile latency
-    "mask_blur_factor": 5,  # Lower = sharper try-on edges (was 9, which over-softened boundaries)
+    "mask_blur_factor": 0,  # AutoMasker already has internal GaussianBlur; second blur causes halo
     "output_format": "jpeg",  # 'jpeg' (faster, smaller) or 'png' (lossless, larger)
     "output_jpeg_quality": 98,  # 95→98 for less compression artifacting
 }
@@ -210,7 +212,24 @@ def load_models(config: dict):
             device='cuda',
         )
         print("AutoMasker loaded successfully!")
-        
+
+        # Load BiRefNet for background removal (replaces SCHP+OpenCV pipeline)
+        print("Loading BiRefNet background removal model...")
+        try:
+            from transformers import AutoModelForImageSegmentation
+            global _birefnet
+            _birefnet = AutoModelForImageSegmentation.from_pretrained(
+                "ZhengPeng7/BiRefNet",
+                trust_remote_code=True,
+                torch_dtype=torch.float16,
+            )
+            _birefnet.to("cuda")
+            _birefnet.eval()
+            print("BiRefNet loaded successfully!")
+        except Exception as birefnet_err:
+            print(f"WARNING: BiRefNet failed to load ({birefnet_err}); will return original image on bg removal.", flush=True)
+            _birefnet = None
+
         # Signal that models are loaded
         _model_loaded.set()
         
@@ -307,37 +326,82 @@ def image_hash(image: Image.Image) -> str:
     return hashlib.md5(img_bytes.getvalue()).hexdigest()
 
 
-def remove_background_from_person(person_img: Image.Image, automask_result: Dict) -> Image.Image:
+def remove_background_birefnet(person_img: Image.Image) -> Image.Image:
     """
-    Remove scene background using SCHP parsing maps from AutoMasker.
-    Keeps foreground body pixels and replaces background with a neutral backdrop.
+    Remove scene background using BiRefNet alpha matting.
 
-    Uses generous dilation (11x11 ×2 iters) so SCHP gaps around hands/hair don't clip
-    the body — clipped body parts were a major source of "output not close to expected".
-    A wider Gaussian blur creates a soft alpha falloff so the bg edge looks natural.
-    Falls back to the original image if SCHP coverage is suspiciously low (<5% of pixels).
+    BiRefNet produces a true alpha matte — sharp hair strands, fingers, and
+    sleeve edges — without the halo/blur artifacts from the old SCHP+dilate+GaussianBlur
+    pipeline. Composites over the same neutral gray (245, 245, 245) used before.
+
+    Falls back to the original image if BiRefNet is unavailable or inference fails.
     """
-    rgb = np.array(person_img.convert("RGB"))
-    schp_atr = np.array(automask_result["schp_atr"])
-    schp_lip = np.array(automask_result["schp_lip"])
-
-    # Label 0 is background in both parsers; keep pixel if either parser marks foreground.
-    fg_raw = ((schp_atr != 0) | (schp_lip != 0)).astype(np.uint8)
-
-    # Safety check: if SCHP returned almost nothing, segmentation failed — keep original
-    # image rather than wiping out the person entirely.
-    if fg_raw.mean() < 0.05:
-        print("WARNING: SCHP foreground coverage <5%; skipping background removal", flush=True)
+    global _birefnet
+    if _birefnet is None:
+        print("WARNING: BiRefNet not loaded; returning original image.", flush=True)
         return person_img
 
-    fg = fg_raw * 255
-    fg = cv2.dilate(fg, np.ones((11, 11), np.uint8), iterations=2)
-    fg = cv2.GaussianBlur(fg, (15, 15), 0)
-    alpha = np.clip(fg.astype(np.float32) / 255.0, 0.0, 1.0)[..., None]
+    try:
+        orig_w, orig_h = person_img.size
+        img_rgb = person_img.convert("RGB")
+        img_np = np.array(img_rgb, dtype=np.float32) / 255.0  # (H, W, 3) in [0,1]
 
-    bg = np.full_like(rgb, 245, dtype=np.uint8)
-    composited = (rgb.astype(np.float32) * alpha + bg.astype(np.float32) * (1.0 - alpha)).astype(np.uint8)
-    return Image.fromarray(composited)
+        # (1, 3, H, W)
+        img_t = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0)  # float32
+
+        # BiRefNet uses standard ImageNet normalization
+        mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
+        std  = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
+        img_t = (img_t - mean) / std
+
+        # BiRefNet was trained at 1024×1024
+        img_t = F.interpolate(img_t, size=(1024, 1024), mode="bilinear", align_corners=False)
+        img_t = img_t.to("cuda", dtype=torch.float16)
+
+        with torch.no_grad():
+            # Model returns a list of multi-scale predictions; last is the finest.
+            raw_out = _birefnet(img_t)
+            # raw_out may be a list or a tuple — take the last element
+            last = raw_out[-1]
+            # If last is itself a list/tuple (some BiRefNet versions), unwrap once more
+            if isinstance(last, (list, tuple)):
+                last = last[-1]
+            preds = last.sigmoid().float()  # (1, 1, H, W)
+
+        print(f"[BiRefNet] pred shape={preds.shape} min={preds.min():.3f} max={preds.max():.3f} mean={preds.mean():.3f}", flush=True)
+
+        # Upsample alpha back to original resolution
+        alpha = F.interpolate(preds, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
+        alpha = alpha.squeeze().cpu().numpy()  # (H, W) float32 in [0, 1]
+
+        print(f"[BiRefNet] alpha after resize: min={alpha.min():.3f} max={alpha.max():.3f} mean={alpha.mean():.3f}", flush=True)
+
+        # Normalize to guarantee full [0, 1] range
+        a_min, a_max = alpha.min(), alpha.max()
+        if a_max - a_min > 1e-6:
+            alpha = (alpha - a_min) / (a_max - a_min)
+
+        # Safety check: if BiRefNet detected almost nothing, skip compositing
+        if alpha.mean() < 0.05:
+            print("WARNING: BiRefNet foreground coverage <5%; returning original image.", flush=True)
+            return person_img
+
+        # Binarize alpha at 0.5 so edge pixels are either fully person or fully gray.
+        # Soft alpha blending leaves original background color in edge pixels, which
+        # the VAE encoder spreads into surrounding latents and re-appears in try-on output.
+        alpha = (alpha >= 0.5).astype(np.float32)
+        alpha = alpha[..., None]  # (H, W, 1)
+
+        rgb = np.array(img_rgb, dtype=np.float32)
+        bg  = np.full_like(rgb, 245.0)
+        composited = (rgb * alpha + bg * (1.0 - alpha)).clip(0, 255).astype(np.uint8)
+        print(f"[BiRefNet] compositing done. Output size: {orig_w}x{orig_h}", flush=True)
+        return Image.fromarray(composited)
+
+    except Exception as e:
+        print(f"WARNING: BiRefNet inference failed ({e}); returning original image.", flush=True)
+        import traceback; traceback.print_exc()
+        return person_img
 
 
 def get_cache_key(person_img: Image.Image, cloth_type: str) -> str:
@@ -455,6 +519,7 @@ async def health_check():
         "status": "healthy",
         "message": "Service is ready",
         "gpu_available": lock_available,
+        "birefnet_loaded": _birefnet is not None,
         "total_requests": _request_stats["total_requests"],
         "avg_lock_wait_seconds": round(avg_wait_time, 2) if avg_wait_time > 0 else 0,
         "cache_size": cache_size,
@@ -539,6 +604,8 @@ async def preprocess_person(
         print("Preprocessing cache MISS: Generating mask...")
         mask_start_time = time.time()
         
+        # Remove background first so SCHP receives a clean person silhouette (no BG noise).
+        person_img = remove_background_birefnet(person_img)
         # AutoMasker runs on the same GPU and can slow active try-on inference.
         # Serialize with inference lock to avoid contention spikes.
         with gpu_inference_lock(
@@ -546,9 +613,9 @@ async def preprocess_person(
             busy_detail="GPU busy; preprocess skipped. Try-on can still proceed and will preprocess on demand.",
         ):
             mask_result = _automasker(person_img, cloth_type)
-        person_img = remove_background_from_person(person_img, mask_result)
         mask = mask_result['mask']
-        mask = _mask_processor.blur(mask, blur_factor=DEFAULT_CONFIG["mask_blur_factor"])
+        if DEFAULT_CONFIG["mask_blur_factor"] > 0:
+            mask = _mask_processor.blur(mask, blur_factor=DEFAULT_CONFIG["mask_blur_factor"])
 
         mask_time = time.time() - mask_start_time
         print(f"Mask generation took {mask_time:.2f}s")
@@ -772,14 +839,16 @@ async def try_on(
                 # Cache miss - generate mask using AutoMasker
                 print("Cache MISS: Generating mask...")
                 mask_start_time = time.time()
+                # Remove background first so SCHP receives a clean person silhouette.
+                person_img = remove_background_birefnet(person_img)
                 with gpu_inference_lock(
                     timeout_seconds=8,
                     busy_detail="GPU busy; preprocess skipped. Try-on can still proceed and will preprocess on demand.",
                 ):
                     mask_result = _automasker(person_img, cloth_type)
-                person_img = remove_background_from_person(person_img, mask_result)
                 mask = mask_result['mask']
-                mask = _mask_processor.blur(mask, blur_factor=DEFAULT_CONFIG["mask_blur_factor"])
+                if DEFAULT_CONFIG["mask_blur_factor"] > 0:
+                    mask = _mask_processor.blur(mask, blur_factor=DEFAULT_CONFIG["mask_blur_factor"])
                 mask_time = time.time() - mask_start_time
                 print(f"Mask generation took {mask_time:.2f}s")
                 
@@ -855,6 +924,23 @@ async def try_on(
             # Clear GPU cache after inference (ONLY after, not before)
             torch.cuda.empty_cache()
         
+        # Post-composite: for mask=0 (face, legs, background) paste the BiRefNet-cleaned
+        # person back in. This corrects any diffusion drift outside the garment area and
+        # guarantees a clean gray background with no real-bg bleed-through.
+        try:
+            result_np  = np.array(result_image).astype(np.float32)
+            person_np  = np.array(person_img.convert('RGB')).astype(np.float32)
+            mask_pil   = mask.convert('L')
+            if mask_pil.size != result_image.size:
+                mask_pil = mask_pil.resize(result_image.size, Image.NEAREST)
+            mask_arr   = np.array(mask_pil).astype(np.float32) / 255.0
+            mask_arr   = mask_arr[..., None]  # (H, W, 1)
+            composited = (result_np * mask_arr + person_np * (1.0 - mask_arr)).clip(0, 255).astype(np.uint8)
+            result_image = Image.fromarray(composited)
+            print("[TRY-ON] Post-composite applied.", flush=True)
+        except Exception as comp_err:
+            print(f"[TRY-ON] Post-composite failed ({comp_err}); using raw inference output.", flush=True)
+
         # Convert to base64
         print("[TRY-ON] Step 10: Encoding result to base64...", flush=True)
         result_base64, result_mime = image_to_base64(
@@ -969,6 +1055,38 @@ async def clear_cache():
         "success": True,
         "message": f"Cache cleared. Removed {cleared_count} entries.",
         "cache_size": 0
+    }
+
+
+@app.post("/api/remove-background")
+async def test_remove_background(image: UploadFile = File(...)):
+    """
+    Test endpoint: runs only BiRefNet background removal on a person image.
+    Returns the composited PNG (person on gray background) as base64.
+    Use this to verify BiRefNet quality without running the full try-on pipeline.
+    """
+    if not _model_loaded.is_set():
+        raise HTTPException(status_code=503, detail="Models still loading, try again shortly.")
+
+    contents = await image.read()
+    try:
+        person_img = Image.open(io.BytesIO(contents)).convert("RGB")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not decode image.")
+
+    t0 = time.time()
+    result = remove_background_birefnet(person_img)
+    elapsed = round(time.time() - t0, 3)
+
+    buf = io.BytesIO()
+    result.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    return {
+        "success": True,
+        "processing_time_seconds": elapsed,
+        "image_base64": b64,
+        "mime_type": "image/png",
     }
 
 
